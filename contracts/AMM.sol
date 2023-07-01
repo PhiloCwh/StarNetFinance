@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: MIT
-//import "./lptoken.sol";
 import "./interfaces/ILPToken.sol";
-//import "./IERC20.sol";
 import "./lptoken.sol";
-import "./interfaces/IWETH.sol";
 import "./interfaces/IAMM.sol";
-//import "./StableAlgorithm.sol";
 
 pragma solidity ^0.8.9;
 
-contract AnchorFinance is IAMM{
+contract AMMbasic {
 //全局变量
 
 
@@ -19,15 +15,11 @@ contract AnchorFinance is IAMM{
     address [] public lpTokenAddressList;//lptoken的数组
     mapping(address => mapping(address => uint)) reserve;//第一个address是lptoken的address ，第2个是相应token的资产，uint是资产的amount
     uint userFee;//fee to pool
-    //检索lptoken
-    mapping(address => mapping(address => address)) public findLpToken;
-    mapping (address=> mapping (address => address)) public findStableLpToken;
-    IWETH  WETH;
-    address  WETHAddr;
-    //mapping (address => bool) public isStablePair;
-    mapping (address=>uint) stablelpParameterA;
-    mapping (address => address[2]) _lpInfo;
-    mapping (address => bool) _lpSwapStatic;
+    mapping(address => mapping(address => address)) public findLpToken;//查找到lptoken
+    mapping (address=> mapping (address => address)) public findStableLpToken;//查找到稳定币的lptoken
+    mapping (address=>uint) stablelpParameterA;//调控稳定币对的交易参数
+    mapping (address => address[2]) _lpInfo;//通过lp找到原来两个币对
+    mapping (address => bool) _lpSwapStatic;//稳定币交易暂停
 
 
 
@@ -39,6 +31,7 @@ contract AnchorFinance is IAMM{
 
     receive() payable external {}
 
+    //防止重入攻击
     modifier reEntrancyMutex() {
         bool _reEntrancyMutex;
 
@@ -48,7 +41,7 @@ contract AnchorFinance is IAMM{
         _reEntrancyMutex = false;
 
     }
-
+    //管理员权限
     modifier onlyOwner (){
         require(msg.sender == owner,"fuck");
         _;
@@ -60,17 +53,14 @@ contract AnchorFinance is IAMM{
         owner = _newOwner;
     }
     function setFee(uint fee) external onlyOwner{
-        userFee = fee;// dx / 10000
+        userFee = fee;
     }
 
     function setlpA(address _lpPair, uint _A) public  onlyOwner{
         stablelpParameterA[_lpPair] = _A;
     }
 
-    function setWeth(address _wethAddr) external onlyOwner{
-        WETH = IWETH(_wethAddr);
-        WETHAddr = _wethAddr;
-    }
+    //是否暂停lp的交易
     function setLpSwapStatic(address _lpAddr, bool _static) external onlyOwner{
         _lpSwapStatic[_lpAddr] = _static;
     }
@@ -78,17 +68,7 @@ contract AnchorFinance is IAMM{
 //业务合约
     //添加流动性
 
-    function addLiquidityWithETH(address _token, uint _tokenAmount) public payable reEntrancyMutex
-    {
-        uint ETHAmount = msg.value;
-        address user = msg.sender;
-       // address addr = address(this);
-        WETH.depositETH{value : ETHAmount}();
-        //WETH.approve(user,ETHAmount);
-        WETH.transfer(user,ETHAmount);
-        addLiquidity(WETHAddr,_token, ETHAmount,_tokenAmount);
 
-    }
 
 
 
@@ -101,40 +81,23 @@ contract AnchorFinance is IAMM{
         IERC20 token0 = IERC20(_token0);
         IERC20 token1 = IERC20(_token1);
         
-        //token1.transferFrom(msg.sender, address(this), _amount1);
         address lptokenAddr;
 
-        /*
-        How much dx, dy to add?
-        xy = k
-        (x + dx)(y + dy) = k'
-        No price change, before and after adding liquidity
-        x / y = (x + dx) / (y + dy)
-        x(y + dy) = y(x + dx)
-        x * dy = y * dx
-        x / y = dx / dy
-        dy = y / x * dx
-        */
-        //问题：
-        /*
-        如果项目方撤出所有流动性后会存在问题
-        1.添加流动性按照比例 0/0 会报错
 
-        解决方案：
-        每次添加至少n个token
-        且remove流动性至少保留n给在amm里面
-
-        */
-
-
+        //当流动性对未被创建的时候
         if (findLpToken[_token1][_token0] == address(0)) {
-            //当lptoken = 0时，创建lptoken
+
+            //可以lp做市商可以得到的lptoken数量
             shares = _sqrt(_amount0 * _amount1);
 
+            //创建lp对
             createPair(_token0,_token1);
 
+            //找到lp地址并铸造lptoken
             lptokenAddr = findLpToken[_token1][_token0];
-            lptoken = ILPToken(lptokenAddr);//获取lptoken地址
+            lptoken = ILPToken(lptokenAddr);
+
+            //记录lptoken对的创建者
             pairCreator[lptokenAddr] = msg.sender;
 
             token0.transferFrom(msg.sender, address(this), _amount0);
@@ -142,50 +105,58 @@ contract AnchorFinance is IAMM{
 
             
         } else {
+
+            //lpaddr不为0时
             lptokenAddr = findLpToken[_token1][_token0];
-            lptoken = ILPToken(lptokenAddr);//获取lptoken地址
+            lptoken = ILPToken(lptokenAddr);
             shares = _min(
                 (_amount0 * lptoken.totalSupply()) / reserve[lptokenAddr][_token0],
                 (_amount1 * lptoken.totalSupply()) / reserve[lptokenAddr][_token1]
             );
+
+            //重新计算amount1的数量
             _amount1 = reserve[lptokenAddr][_token1] * _amount0 / reserve[lptokenAddr][_token0];
+
             token0.transferFrom(msg.sender, address(this), _amount0);
             token1.transferFrom(msg.sender, address(this), _amount1);
-            //获取lptoken地址
         }
         require(shares > 0, "shares = 0");
+
+        //铸造lptoken
         lptoken.mint(msg.sender,shares);
         
 
         _update(lptokenAddr,_token0, _token1, reserve[lptokenAddr][_token0] + _amount0, reserve[lptokenAddr][_token1] + _amount1);
     }
 
-    // to do
+    // 用户添加流动性
     function addLiquidityWithStablePairByUser(address _token0, address _token1, uint _amount0) public returns (uint shares) {
         
         ILPToken lptoken;//lptoken接口，为了mint 和 burn lptoken
         
         require(_amount0 > 0 ,"require _amount0 > 0 && _amount1 >0");
         require(_token0 != _token1, "_token0 == _token1");
+
+        //判断是否为稳定币的lp对
         require(findStableLpToken[_token0][_token1] != address(0),"invalid tokenpair");
         IERC20 token0 = IERC20(_token0);
         IERC20 token1 = IERC20(_token1);
-        token0.transferFrom(msg.sender, address(this), _amount0);
+        
         address lptokenAddr;
         
-
-
-
         lptokenAddr = findStableLpToken[_token1][_token0];
-        //require(isStablePair[lptokenAddr],"not StablePair");
+
         uint amount1 =   reserve[lptokenAddr][_token1] * _amount0 / reserve[lptokenAddr][_token0];
+
+        token0.transferFrom(msg.sender, address(this), _amount0);
         token1.transferFrom(msg.sender, address(this), amount1);
-        lptoken = ILPToken(lptokenAddr);//获取lptoken地址
+
+        lptoken = ILPToken(lptokenAddr);
         shares = _min(
             (_amount0 * lptoken.totalSupply()) / reserve[lptokenAddr][_token0],
             (amount1 * lptoken.totalSupply()) / reserve[lptokenAddr][_token1]
         );
-            //获取lptoken地址
+
         require(shares > 0, "shares = 0");
         lptoken.mint(msg.sender,shares);
         
@@ -210,21 +181,15 @@ contract AnchorFinance is IAMM{
 
         shares = _sqrt(_amount0 * _amount1);
         lptokenAddr = createStablePair(_token0,_token1);
-        //lptokenAddr = findLpToken[_token1][_token0];
 
         ILPToken lptoken;//lptoken接口，为了mint 和 burn lptoken
         lptoken = ILPToken(lptokenAddr);//获取lptoken地址
 
         pairCreator[lptokenAddr] = msg.sender;
-        //_amount1 = calOutput(100,reserve[lptokenAddr][_token0] + reserve[lptokenAddr][_token1], reserve[lptokenAddr][_token0],_amount0);
-
-
-        //isStablePair[lptokenAddr] = true;
             
         require(shares > 0, "shares = 0");
         lptoken.mint(msg.sender,shares);
 
-        //setlpA(lptokenAddr, _A);
         
 
         _update(lptokenAddr,_token0, _token1, reserve[lptokenAddr][_token0] + _amount0, reserve[lptokenAddr][_token1] + _amount1);
@@ -235,7 +200,7 @@ contract AnchorFinance is IAMM{
     //移除流动性
     {
         addLiquidityWithStablePair(_token0, _token1, _amount0, _amount1);
-        setlpA(findLpToken[_token0][_token1], _A);
+        setlpA(findStableLpToken[_token0][_token1], _A);
     }
     function removeLiquidity(
         address _token0,
@@ -266,34 +231,49 @@ contract AnchorFinance is IAMM{
         token1.transfer(msg.sender, amount1);
     }
 
+    function removeLiquidityWithStableCoin(
+        address _token0,
+        address _token1,
+        uint _shares
+    ) public  returns (uint amount0, uint amount1) {
+        ILPToken lptoken;//lptoken接口，为了mint 和 burn lptoken
+        IERC20 token0 = IERC20(_token0);
+        IERC20 token1 = IERC20(_token1);
+        address lptokenAddr = findStableLpToken[_token0][_token1];
+
+        lptoken = ILPToken(lptokenAddr);
+
+        if(pairCreator[lptokenAddr] == msg.sender)
+        {
+            require(lptoken.balanceOf(msg.sender) - _shares > 100 ,"paieCreator should left 100 wei lptoken in pool");
+        }
+
+        amount0 = (_shares * reserve[lptokenAddr][_token0]) / lptoken.totalSupply();//share * totalsuply/bal0
+        amount1 = (_shares * reserve[lptokenAddr][_token1]) / lptoken.totalSupply();
+        require(amount0 > 0 && amount1 > 0, "amount0 or amount1 = 0");
+
+        lptoken.burn(msg.sender, _shares);
+        _update(lptokenAddr,_token0, _token1, reserve[lptokenAddr][_token0] - amount0, reserve[lptokenAddr][_token1] - amount1);
+        
+
+        token0.transfer(msg.sender, amount0);
+        token1.transfer(msg.sender, amount1);
+    }
+
     //交易
 
-    function swapWithETH(address _tokenOut,uint _disirSli) public payable reEntrancyMutex
-    {
-        uint amountIn = msg.value;
-        WETH.depositETH{value : amountIn}();
-        swapByLimitSli(WETHAddr,_tokenOut,amountIn, _disirSli);
-    }
-
-
-    function swapToETH(address _tokenIn, uint _amountIn, uint _disirSli)public {
-        uint amountOut = swapByLimitSli(_tokenIn,WETHAddr,_amountIn, _disirSli);
-        WETH.withdrawETH(amountOut);
-        address payable user = payable(msg.sender);
-        user.transfer(amountOut);
-
-    }
+  
 
 
     function swapByPath(uint _amountIn, uint _disirSli,address [] memory _path) public {
         uint amountIn = _amountIn;
         for(uint i; i < _path.length - 1; i ++ ){
             (address tokenIn,address tokenOut) = (_path[i],_path[i + 1]);
-            amountIn = swapByLimitSli(tokenIn, tokenOut, amountIn, _disirSli);
+            amountIn = swap(tokenIn, tokenOut, amountIn, _disirSli);
         }
     }
 
-    function swapByLimitSli(address _tokenIn, address _tokenOut, uint _amountIn, uint _disirSli) public returns(uint amountOut){
+    function swap(address _tokenIn, address _tokenOut, uint _amountIn, uint _disirSli) public returns(uint amountOut){
         require(
             findLpToken[_tokenIn][_tokenOut] != address(0),
             "invalid token"
@@ -327,24 +307,7 @@ contract AnchorFinance is IAMM{
 
     }
 
-    function calSwapWithStableCoinAmount(address _tokenIn, address _tokenOut, uint _amountIn) public view returns(uint reserveIn,uint reserveOut,uint amountOut){
-        require(_amountIn > 0, "amount in = 0");
-        require(_tokenIn != _tokenOut);
 
-        address lptokenAddr = findStableLpToken[_tokenIn][_tokenOut];
-        reserveIn = reserve[lptokenAddr][_tokenIn];
-        reserveOut = reserve[lptokenAddr][_tokenOut];
-
-
-
-        //交易税收 
-        uint amountInWithFee = (_amountIn * (10000-userFee)) / 10000;
-        //amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
-        amountOut = calOutput(getA(lptokenAddr),reserveIn + reserveOut, reserveIn,amountInWithFee);
-
-
-
-    }
 
     function swapWithStableCoin(address _tokenIn, address _tokenOut, uint _amountIn) public returns(uint amountOut){
         require(
@@ -369,13 +332,9 @@ contract AnchorFinance is IAMM{
 
         //交易税收 
         uint amountInWithFee = (_amountIn * (10000-userFee)) / 10000;
-        //amountOut = (reserveOut * amountInWithFee) / (reserveIn + amountInWithFee);
+
+        //计算输出token数量
         amountOut = calOutput(getA(lptokenAddr),reserveIn + reserveOut, reserveIn,amountInWithFee);
-
-        //检查滑点
-        //setSli(amountInWithFee,reserveIn,reserveOut,_disirSli);
-        //setSliBystable(amountOut,amountInWithFee,reserveIn,reserveOut,_disirSli);
-
 
         tokenOut.transfer(msg.sender, amountOut);
         uint totalReserve0 = reserve[lptokenAddr][_tokenIn] + _amountIn; 
@@ -390,6 +349,11 @@ contract AnchorFinance is IAMM{
     function getReserve(address _lpTokenAddr, address _tokenAddr) public view returns(uint)
     {
         return reserve[_lpTokenAddr][_tokenAddr];
+    }
+
+    function getUserFee()public view returns(uint) {
+        return userFee;
+        
     }
 
     function getLptoken(address _tokenA, address _tokenB) public view returns(address)
@@ -415,6 +379,11 @@ contract AnchorFinance is IAMM{
         return lpTokenAddressList.length;
     }
 
+    function getlptokenList(uint _index) public view returns(address)
+    {
+        return lpTokenAddressList[_index];
+    }
+
 //依赖方法
     //creatpair
 
@@ -424,11 +393,11 @@ contract AnchorFinance is IAMM{
                 addrToken0,addrToken1
             )
         );
-        new LPToken{
+
+        address lptokenAddr = address(new LPToken{
             salt : bytes32(_salt)
         }
-        ();
-        address lptokenAddr = getAddress(getBytecode(),_salt);
+        ());
 
          //检索lptoken
         lpTokenAddressList.push(lptokenAddr);
@@ -446,11 +415,10 @@ contract AnchorFinance is IAMM{
                 addrToken0,addrToken1,"stablecoin"
             )
         );
-        new LPToken{
+        address lptokenAddr = address(new LPToken{
             salt : bytes32(_salt)
         }
-        ();
-        address lptokenAddr = getAddress(getBytecode(),_salt);
+        ());
 
          //检索lptoken
         lpTokenAddressList.push(lptokenAddr);
@@ -485,7 +453,7 @@ contract AnchorFinance is IAMM{
         return stablelpParameterA[_lpAddr];
     }
 
-    function lpInfo(address _lpAddr) public view returns(address [2] memory){
+    function getlpInfo(address _lpAddr) public view returns(address [2] memory){
         return _lpInfo[_lpAddr];
     }
 
